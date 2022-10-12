@@ -283,7 +283,7 @@ class GreedyDecoder(TokenDecoder):
 #TODO: add kenlm with beam search
 class BeamSearchDecoderWithLM(TokenDecoder):
     def __init__(self, beam_size: int, eot: int, inference: Inference, patience: Optional[float] = None, 
-                    lm_path: Optional[str] = None, lm_alpha: Optional[float] = 0.5, lm_beta: Optional[float] = 0.5):
+                    lm_path = "./dataset_tokenized_3gram.binary", lm_alpha = 0.5, lm_beta = 0.5):
         self.beam_size = beam_size
         self.eot = eot
         self.inference = inference
@@ -309,6 +309,7 @@ class BeamSearchDecoderWithLM(TokenDecoder):
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
+        print(f"logprobs.shape: {logprobs.shape}")
         next_tokens, source_indices, finished_sequences = [], [], []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
