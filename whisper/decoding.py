@@ -329,7 +329,7 @@ class BeamSearchDecoderWithLM(TokenDecoder):
                     lm_score = self.lm.score(curr_prefix_str, bos = True, eos = False)
                     # Formula: https://pytorch.org/blog/fast-beam-search-decoding-in-pytorch-with-torchaudio-and-flashlight-text/
                     # convert lm_score log 10 to log e
-                    logprob = logprob - self.lm_alpha*lm_score*2.303 + self.lm_beta*len(reverse_curr_prefix_str.split())
+                    logprob = logprob + self.lm_alpha*lm_score*2.303 + self.lm_beta*len(reverse_curr_prefix_str.split())
                     new_logprob = (sum_logprobs[idx] + logprob).item() 
                     # print(f"[Audio {i}, beam {j}]lm_score of {reverse_curr_prefix_str}: {lm_score}, new_logprob: {(sum_logprobs[idx] + logprob).item()}")
                     sequence = tuple(prefix + [token.item()])
