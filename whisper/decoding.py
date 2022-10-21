@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.distributions import Categorical
 import kenlm
+from transformers import GPT2LMHeadModel
 
 from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
@@ -280,7 +281,6 @@ class GreedyDecoder(TokenDecoder):
         tokens = F.pad(tokens, (0, 1), value=self.eot)
         return tokens, sum_logprobs.tolist()
 
-#TODO: add kenlm with beam search
 class BeamSearchDecoderWithLM(TokenDecoder):
     def __init__(self, beam_size: int, eot: int, inference: Inference, patience: Optional[float] = None, 
                     lm_path: Optional[str] = None, lm_alpha: Optional[float] = 0.5, lm_beta: Optional[float] = 0.5):
@@ -290,7 +290,7 @@ class BeamSearchDecoderWithLM(TokenDecoder):
         self.patience = patience or 1.0
         self.max_candidates: int = round(beam_size * self.patience)
         self.finished_sequences = None
-        self.lm: "kenlm.Model" = kenlm.Model(lm_path)
+        self.lm: "kenlm.Model" = kenlm.Model(lm_path) if lm_path else None
         self.tokenizer = get_tokenizer('vi')
         self.lm_alpha = lm_alpha
         self.lm_beta = lm_beta
@@ -305,35 +305,59 @@ class BeamSearchDecoderWithLM(TokenDecoder):
             raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
 
         n_audio = tokens.shape[0] // self.beam_size
+        # print(f"n_audio: {n_audio}, tokens.shape: {tokens.shape}, self.beam_size: {self.beam_size}")
         if self.finished_sequences is None:  # for the first update
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
+        # https://github.com/openai/whisper/discussions/361
+        # we only use tokenizer token, all token id after 50364 and 50364 are all timestamp tokens
+        # because we pass without_timestamp=True to tokenizer, we only get token id < 50364
+        logprobs_for_lm = F.log_softmax(logits.float(), dim=-1)[:, :self.tokenizer.tokenizer.vocab_size + 1]
+
         next_tokens, source_indices, finished_sequences = [], [], []
-        for i in range(n_audio):
+
+        for i in range(int(n_audio)):
             scores, sources, finished = {}, {}, {}
 
             # STEP 1: calculate the cumulative log probabilities for possible candidates
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
                 prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
-                    # calculate the language model score, the result is in the log10 probability already
-                    curr_prefix = prefix[3:] + [token.item()] # int arr
-                    curr_prefix_split = [chr(t + 100) for t in curr_prefix] # offset = 100, str arr
-                    curr_prefix_str = " ".join([c for c in curr_prefix_split if c is not None])
-                    reverse_curr_prefix_str = self.tokenizer.decode(
-                        [ord(i) - 100 for i in curr_prefix_split]
-                        )
-                        
-                    lm_score = self.lm.score(curr_prefix_str, bos = True, eos = False)
-                    # Formula: https://pytorch.org/blog/fast-beam-search-decoding-in-pytorch-with-torchaudio-and-flashlight-text/
-                    # convert lm_score log 10 to log e
-                    logprob = logprob + self.lm_alpha*lm_score*2.303 + self.lm_beta*len(reverse_curr_prefix_str.split())
-                    new_logprob = (sum_logprobs[idx] + logprob).item() 
-                    # print(f"[Audio {i}, beam {j}]lm_score of {reverse_curr_prefix_str}: {lm_score}, new_logprob: {(sum_logprobs[idx] + logprob).item()}")
+
+                # we skip first 4 special tokens
+                if (len(prefix) > 4):
+                    curr_state = kenlm.State()
+                    next_state = kenlm.State()
+                    self.lm.BeginSentenceWrite(curr_state)
+                    lm_score = []
+                    prob = 0.0
+                    for k in range(len(prefix[4:])):
+                        # chr(prefix[k + 4] + 100) since we encode the text with 100 offset
+                        # https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/kenlm_utils.py
+                        prob += self.lm.BaseScore(curr_state, chr(prefix[k + 4] + 100), next_state)
+                        curr_state, next_state = next_state, curr_state
+                    # save last state so that we do not have to recompute the whole sentence
+                    last_state = curr_state
+                    # calculate all log10 probabilities of all tokens
+                    # this is not efficient: https://github.com/kpu/kenlm/issues/367
+                    for k in range(self.tokenizer.tokenizer.vocab_size):
+                        new_token_state = kenlm.State()
+                        new_token_score = self.lm.BaseScore(last_state, chr(k + 100), new_token_state)
+                        lm_score.append(new_token_score)
+
+                    # add <endoftext> token's probability, which is </s> in kenlm
+                    lm_score.append(self.lm.BaseScore(last_state, "</s>", new_token_state))
+                    lm_score = torch.FloatTensor(lm_score, device=tokens.device)
+                    
+                    # common shallow fusion
+                    temp_logprobs_idx = logprobs_for_lm[idx] + self.lm_alpha*lm_score
+                else:
+                    temp_logprobs_idx = logprobs_for_lm[idx]
+                for logprob, token in zip(*temp_logprobs_idx.topk(self.beam_size + 1)):
+                    logprob = (sum_logprobs[idx] + logprob).item() 
                     sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
+                    scores[sequence] = logprob
                     sources[sequence] = idx
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
@@ -411,6 +435,7 @@ class BeamSearchDecoder(TokenDecoder):
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
+
         next_tokens, source_indices, finished_sequences = [], [], []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
@@ -702,10 +727,10 @@ class DecodingTask:
         n_batch = tokens.shape[0]
         sum_logprobs: Tensor = torch.zeros(n_batch, device=audio_features.device)
         no_speech_probs = [np.nan] * n_batch
-
         try:
             for i in range(self.sample_len):
                 logits = self.inference.logits(tokens, audio_features)
+                
 
                 if i == 0 and self.tokenizer.no_speech is not None:  # save no_speech_probs
                     probs_at_sot = logits[:, self.sot_index].float().softmax(dim=-1)
@@ -824,3 +849,4 @@ def decode(model: "Whisper", mel: Tensor, options: DecodingOptions = DecodingOpt
         result = result[0]
 
     return result
+
