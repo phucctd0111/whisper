@@ -348,7 +348,7 @@ class BeamSearchDecoderWithLM(TokenDecoder):
 
                     # add <endoftext> token's probability, which is </s> in kenlm
                     lm_score.append(self.lm.BaseScore(last_state, "</s>", new_token_state))
-                    lm_score = torch.FloatTensor(lm_score, device=tokens.device)
+                    lm_score = torch.FloatTensor(lm_score, device='cpu')
                     
                     # common shallow fusion
                     temp_logprobs_idx = logprobs_for_lm[idx] + self.lm_alpha*lm_score
@@ -376,7 +376,7 @@ class BeamSearchDecoderWithLM(TokenDecoder):
 
             finished_sequences.append(finished)
 
-        tokens = torch.tensor(next_tokens, device=tokens.device)
+        tokens = torch.tensor(next_tokens, device='cpu')
         self.inference.rearrange_kv_cache(source_indices)
 
         # add newly finished sequences to self.finished_sequences
